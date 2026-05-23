@@ -27,7 +27,7 @@ on:
 jobs:
   delegar:
     # Aquí se delega en el repo externo
-    uses: asanchezo-duoc/AUY1104-SharedWorkflows/.github/workflows/infra2-ea2-provision-cloud-lab.yaml@EA2
+    uses: asanchezo-duoc/AUY1104-SharedWorkflows/blob/EA2/.github/workflows/ea2-lab-dispatch-main.yaml
     with:
       aws_region: ${{ inputs.aws_region }}
       instance_type: ${{ inputs.instance_type }}
