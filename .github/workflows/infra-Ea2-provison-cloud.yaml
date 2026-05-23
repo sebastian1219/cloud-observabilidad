@@ -1,0 +1,323 @@
+# EA2 · Laboratorio cloud (VPC + 2 MV k3s autocontenido + NLB TCP + RDS + manifiestos)
+# Estado Terraform en S3 (backend remoto): input s3_status_bucket = mismo bucket variable EA2_S3_BUCKET.
+# IAM: s3:GetObject, PutObject, DeleteObject, ListBucket sobre ea2-cloud-lab/<repo>/terraform.tfstate
+#      (sin Dynamo lock por compat Vocareum; no correr dos applies en paralelo al mismo state).
+#
+# - workflow_call: AWS + EA2_SSH_PRIVATE_KEY + DOCKER_USERNAME/PASSWORD (push Docker Hub).
+# - workflow_dispatch: checkout siempre desde main (ref fijo, sin ramas alternas).
+#
+# El balanceador es un NLB (TCP). Un ALB clasico no reenvia NodePorts TCP arbitrarios.
+# DNS publico: usar el hostname del NLB o Route53 (inputs opcionales en Terraform).
+#
+# AMI + AZ: mismos data sources que infra/ea2-sandbox-vm (receta ea2-provision-k8s-sandbox.yaml).
+
+name: INFRA2 - Provisionar EA2 cloud lab (Terraform + k3s + workloads) (local)
+description: VPC, 2 MV Ubuntu misma instalación k3s (sandbox), NLB TCP, RDS, API en Docker Hub, manifiestos.
+
+on:
+  workflow_call:
+    inputs:
+      aws_region:
+        required: false
+        type: string
+        default: us-east-1
+      instance_type:
+        required: false
+        type: string
+        default: t3.medium
+      vpc_octet:
+        required: false
+        type: string
+        default: "42"
+      ssh_cidr_ipv4:
+        required: false
+        type: string
+        default: "0.0.0.0/0"
+      k8s_api_cidr_ipv4:
+        required: false
+        type: string
+        default: "0.0.0.0/0"
+      alb_nodeport_start:
+        required: false
+        type: string
+        default: "30080"
+      alb_nodeport_end:
+        required: false
+        type: string
+        default: "30100"
+      s3_status_bucket:
+        description: Bucket S3 para backend Terraform (terraform.tfstate persistente entre corridas)
+        required: true
+        type: string
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      AWS_SESSION_TOKEN:
+        required: false
+      EA2_SSH_PRIVATE_KEY:
+        required: true
+      DOCKER_USERNAME:
+        required: true
+      DOCKER_PASSWORD:
+        required: true
+
+  workflow_dispatch:
+    inputs:
+      aws_region:
+        required: true
+        type: string
+        default: us-east-1
+      instance_type:
+        required: true
+        type: string
+        default: t3.medium
+      vpc_octet:
+        required: true
+        type: string
+        default: "42"
+      ssh_cidr_ipv4:
+        required: true
+        type: string
+        default: "0.0.0.0/0"
+      k8s_api_cidr_ipv4:
+        required: true
+        type: string
+        default: "0.0.0.0/0"
+      alb_nodeport_start:
+        required: true
+        type: string
+        default: "30080"
+      alb_nodeport_end:
+        required: true
+        type: string
+        default: "30100"
+      s3_status_bucket:
+        description: Bucket S3 para terraform.tfstate (ea2-s3-create-bucket u otro; una vez por repo)
+        required: true
+        type: string
+
+jobs:
+  provision:
+    name: Terraform + k3s + kubectl
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+
+    env:
+      AWS_REGION: ${{ inputs.aws_region }}
+      TF_IN_AUTOMATION: true
+
+    steps:
+      - name: Descargar infra (SharedWorkflows)
+        uses: actions/checkout@v4
+        with:
+          repository: asanchezo-duoc/AUY1104-SharedWorkflows
+          ref: main
+
+      - name: Credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Validar bucket S3 (backend Terraform)
+        run: |
+          set -euo pipefail
+          B="${{ inputs.s3_status_bucket }}"
+          if [ -z "$B" ]; then
+            echo "::error::Definí s3_status_bucket (variable repo EA2_S3_BUCKET)."
+            exit 1
+          fi
+
+      - name: Clave SSH para Terraform
+        env:
+          PEM: ${{ secrets.EA2_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$PEM" > ~/.ssh/ea2_lab.pem
+          chmod 600 ~/.ssh/ea2_lab.pem
+          ssh-keygen -y -f ~/.ssh/ea2_lab.pem > ~/.ssh/ea2_lab.pub
+          echo "TF_VAR_public_key=$(cat ~/.ssh/ea2_lab.pub)" >> "$GITHUB_ENV"
+
+      - name: Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.0
+          terraform_wrapper: false
+
+      - name: terraform init (backend S3 — estado entre corridas)
+        id: tf_backend
+        working-directory: infra/ea2-cloud-lab
+        env:
+          BUCKET: ${{ inputs.s3_status_bucket }}
+          AWS_REGION: ${{ inputs.aws_region }}
+        run: |
+          set -euo pipefail
+          SAFE_REPO=$(echo '${{ github.repository }}' | tr '/' '-')
+          STATE_KEY="ea2-cloud-lab/${SAFE_REPO}/terraform.tfstate"
+          echo "Terraform state: s3://${BUCKET}/${STATE_KEY}"
+          terraform init -input=false \
+            -backend-config="bucket=${BUCKET}" \
+            -backend-config="key=${STATE_KEY}" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="encrypt=true"
+          echo "state_uri=s3://${BUCKET}/${STATE_KEY}" >> "$GITHUB_OUTPUT"
+
+      - name: terraform apply
+        working-directory: infra/ea2-cloud-lab
+        env:
+          TF_VAR_aws_region: ${{ inputs.aws_region }}
+          TF_VAR_instance_type: ${{ inputs.instance_type }}
+          TF_VAR_vpc_octet: ${{ inputs.vpc_octet }}
+          TF_VAR_ssh_cidr_ipv4: ${{ inputs.ssh_cidr_ipv4 }}
+          TF_VAR_k8s_api_cidr_ipv4: ${{ inputs.k8s_api_cidr_ipv4 }}
+          TF_VAR_alb_nodeport_start: ${{ inputs.alb_nodeport_start }}
+          TF_VAR_alb_nodeport_end: ${{ inputs.alb_nodeport_end }}
+        run: terraform apply -auto-approve
+
+      - name: Salidas Terraform
+        id: tf
+        working-directory: infra/ea2-cloud-lab
+        run: |
+          echo "vm_a_pub=$(terraform output -raw vm_a_public_ip)" >> "$GITHUB_OUTPUT"
+          echo "vm_b_pub=$(terraform output -raw vm_b_public_ip)" >> "$GITHUB_OUTPUT"
+          echo "nlb=$(terraform output -raw nlb_dns_name)" >> "$GITHUB_OUTPUT"
+          echo "rds_primary=$(terraform output -raw rds_primary_endpoint)" >> "$GITHUB_OUTPUT"
+          echo "rds_replica=$(terraform output -raw rds_replica_endpoint)" >> "$GITHUB_OUTPUT"
+          echo "rds_user=$(terraform output -raw rds_master_username)" >> "$GITHUB_OUTPUT"
+
+      - name: Esperar SSH (VM A)
+        env:
+          IP: ${{ steps.tf.outputs.vm_a_pub }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 40); do
+            if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ServerAliveInterval=15 -o ServerAliveCountMax=120 -o TCPKeepAlive=yes \
+              -o ConnectTimeout=10 -o BatchMode=yes -i ~/.ssh/ea2_lab.pem "ubuntu@${IP}" 'echo ok'; then
+              exit 0
+            fi
+            echo "intento $i/40..."
+            sleep 15
+          done
+          exit 1
+
+      - name: Esperar SSH (VM B)
+        env:
+          IP: ${{ steps.tf.outputs.vm_b_pub }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 40); do
+            if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ServerAliveInterval=15 -o ServerAliveCountMax=120 -o TCPKeepAlive=yes \
+              -o ConnectTimeout=10 -o BatchMode=yes -i ~/.ssh/ea2_lab.pem "ubuntu@${IP}" 'echo ok'; then
+              exit 0
+            fi
+            sleep 15
+          done
+          exit 1
+
+      # Misma instalación k3s que ea2-provision-k8s-sandbox.yaml (step "Instalar stack Kubernetes", rama k3s), repetida por MV.
+      - name: Instalar k3s (2× igual que sandbox)
+        env:
+          VM_A_PUB: ${{ steps.tf.outputs.vm_a_pub }}
+          VM_B_PUB: ${{ steps.tf.outputs.vm_b_pub }}
+        run: |
+          set -euo pipefail
+          k3s_sandbox_install() {
+            PUBLIC_IP=${1:?ip}
+            REMOTE='ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/ea2_lab.pem ubuntu@'"$PUBLIC_IP"
+            # --tls-san IP publica: igual comentario que sandbox (cert vs elastic IP).
+            $REMOTE "curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC=\"--write-kubeconfig-mode 644 --tls-san ${PUBLIC_IP}\" sh -"
+            $REMOTE 'sudo kubectl get nodes || true'
+          }
+          k3s_sandbox_install "$VM_A_PUB"
+          k3s_sandbox_install "$VM_B_PUB"
+
+      - name: Kubeconfig en el runner
+        env:
+          VM_A_PUB: ${{ steps.tf.outputs.vm_a_pub }}
+        run: |
+          set -euo pipefail
+          # kubectl apply del job usa cluster en VM A (misma convención: primera MV).
+          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=15 -o ServerAliveCountMax=120 \
+            -i ~/.ssh/ea2_lab.pem \
+            "ubuntu@${VM_A_PUB}:/etc/rancher/k3s/k3s.yaml" ./k3s.yaml
+          sed -i "s/127.0.0.1/${VM_A_PUB}/g" ./k3s.yaml
+          echo "KUBECONFIG=$PWD/k3s.yaml" >> "$GITHUB_ENV"
+
+      - name: Login Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build y push imagen API (Docker Hub)
+        id: api_image
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+        run: |
+          set -euo pipefail
+          IMG="${DOCKER_USERNAME}/ea2-cloud-lab-api:latest"
+          docker build -t "$IMG" k8s-manifests/ea2-cloud-lab/api
+          docker push "$IMG"
+          echo "image=$IMG" >> "$GITHUB_OUTPUT"
+
+      - name: Secrets Docker Hub + RDS + despliegues
+        env:
+          API_IMAGE: ${{ steps.api_image.outputs.image }}
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          RDS_PRIMARY: ${{ steps.tf.outputs.rds_primary }}
+          RDS_REPLICA: ${{ steps.tf.outputs.rds_replica }}
+          RDS_USER: ${{ steps.tf.outputs.rds_user }}
+        working-directory: infra/ea2-cloud-lab
+        run: |
+          set -euo pipefail
+          kubectl create secret docker-registry dockerhub-pull \
+            --docker-server=https://index.docker.io/v1/ \
+            --docker-username="$DOCKER_USERNAME" \
+            --docker-password="$DOCKER_PASSWORD" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          DB_PASS="$(terraform output -raw rds_master_password)"
+          kubectl create secret generic ea2-rds-credentials \
+            --from-literal=DB_HOST="$RDS_PRIMARY" \
+            --from-literal=DB_REPLICA_HOST="$RDS_REPLICA" \
+            --from-literal=DB_USER="$RDS_USER" \
+            --from-literal=DB_PASSWORD="$DB_PASS" \
+            --from-literal=DB_NAME=labdb \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          sed "s|REPLACE_API_IMAGE|$API_IMAGE|g" \
+            ../../k8s-manifests/ea2-cloud-lab/api/deployment.yaml | kubectl apply -f -
+          kubectl apply -f ../../k8s-manifests/ea2-cloud-lab/api/service.yaml
+          kubectl apply -f ../../k8s-manifests/ea2-cloud-lab/grafana/
+
+      - name: Resumen
+        env:
+          NLB: ${{ steps.tf.outputs.nlb }}
+          VM_A_PUB: ${{ steps.tf.outputs.vm_a_pub }}
+          VM_B_PUB: ${{ steps.tf.outputs.vm_b_pub }}
+          API_IMAGE: ${{ steps.api_image.outputs.image }}
+        run: |
+          {
+            echo "### EA2 cloud lab"
+            echo ""
+            echo "**NLB (TCP NodePorts):** \`$NLB\`"
+            echo "**API (ejemplo):** \`http://${NLB}:30080/db-primary\`"
+            echo "**Grafana:** \`http://${NLB}:30200\` (admin / LabEa2Grafana)"
+            echo "**SSH VM A:** \`ssh -i <pem> ubuntu@${VM_A_PUB}\`"
+            echo "**SSH VM B:** \`ssh -i <pem> ubuntu@${VM_B_PUB}\`"
+            echo "**Imagen API (Docker Hub):** \`$API_IMAGE\`"
+            echo "**Terraform state (S3):** \`${{ steps.tf_backend.outputs.state_uri }}\`"
+            kubectl get nodes -o wide || true
+            kubectl get svc,po -A || true
+          } >> "$GITHUB_STEP_SUMMARY"
